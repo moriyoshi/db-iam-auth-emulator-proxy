@@ -1,0 +1,85 @@
+# Mock credential endpoints. Both must bind to loopback.
+http_listen: 127.0.0.1:8090
+https_listen: 127.0.0.1:8443
+public_url: http://127.0.0.1:8090
+
+# Certificate and key presented to database clients and the HTTPS endpoint.
+tls_cert: server.crt
+tls_key: server.key
+
+# Each listener is bound to one provider, engine, instance, and upstream.
+listeners:
+  - name: aws-postgres
+    listen: 127.0.0.1:15432
+    provider: aws
+    engine: postgres
+    instance: testdb
+    hostname: 127.0.0.1
+    region: us-east-1
+    resource_id: db-test
+    upstream: 127.0.0.1:25432
+    upstream_tls: disable
+  - name: aws-mysql
+    listen: 127.0.0.1:13306
+    provider: aws
+    engine: mysql
+    instance: testdb
+    hostname: 127.0.0.1
+    region: us-east-1
+    resource_id: db-test
+    upstream: 127.0.0.1:23306
+    upstream_tls: disable
+  - name: google-postgres
+    listen: 127.0.0.1:15433
+    provider: google
+    engine: postgres
+    instance: testdb
+    upstream: 127.0.0.1:25432
+    upstream_tls: disable
+  - name: google-mysql
+    listen: 127.0.0.1:13307
+    provider: google
+    engine: mysql
+    instance: testdb
+    upstream: 127.0.0.1:23306
+    upstream_tls: disable
+  - name: azure-postgres
+    listen: 127.0.0.1:15434
+    provider: azure
+    engine: postgres
+    instance: testdb
+    tenant: test-tenant
+    upstream: 127.0.0.1:25432
+    upstream_tls: disable
+  - name: azure-mysql
+    listen: 127.0.0.1:13308
+    provider: azure
+    engine: mysql
+    instance: testdb
+    tenant: test-tenant
+    upstream: 127.0.0.1:23306
+    upstream_tls: disable
+
+# Fixture identities. Grants name the listeners a principal may use.
+principals:
+  - id: aws-alice
+    grants: [aws-postgres, aws-mysql]
+    backend_user: aws_alice
+    backend_password: replace-me
+    aws_access_key: AKIATEST
+    aws_secret_key: replace-me
+    aws_session_token: replace-me
+    ecs_authorization_token: replace-me
+  - id: google-alice
+    email: alice@example.com
+    grants: [google-postgres, google-mysql]
+    backend_user: google_alice
+    backend_password: replace-me
+    google_refresh_token: replace-me
+  - id: azure-alice
+    email: alice@example.com
+    grants: [azure-postgres, azure-mysql]
+    backend_user: azure_alice
+    backend_password: replace-me
+    azure_client_id: test-client
+    azure_client_secret: replace-me

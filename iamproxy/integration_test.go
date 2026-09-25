@@ -1,0 +1,202 @@
+package iamproxy
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+func TestIntegrationSixProfiles(t *testing.T) {
+	if os.Getenv("IAM_PROXY_E2E") != "1" {
+		t.Skip("set IAM_PROXY_E2E=1 and provide local databases")
+	}
+	pgAddr := os.Getenv("IAM_PROXY_PG_ADDR")
+	if pgAddr == "" {
+		pgAddr = "127.0.0.1:25432"
+	}
+	myAddr := os.Getenv("IAM_PROXY_MYSQL_ADDR")
+	if myAddr == "" {
+		myAddr = "127.0.0.1:23306"
+	}
+	c := &Config{}
+	for _, provider := range []string{"aws", "google", "azure"} {
+		for _, engine := range []string{"postgres", "mysql"} {
+			name := provider + "-" + engine
+			l := Listener{Name: name, Listen: "127.0.0.1:0", Provider: provider, Engine: engine, Instance: "testdb", Hostname: name + ".db.test", Region: "us-east-1", ResourceID: "db-test", Tenant: "tenant-1", UpstreamTLS: "disable"}
+			if engine == "postgres" {
+				l.Upstream = pgAddr
+			} else {
+				l.Upstream = myAddr
+			}
+			c.Listeners = append(c.Listeners, l)
+		}
+	}
+	c.Principals = []Principal{{ID: "alice", Email: "alice@example.com", Grants: []string{"aws-postgres", "aws-mysql", "google-postgres", "google-mysql", "azure-postgres", "azure-mysql"}, BackendUser: "backend", BackendPassword: "backpass", AWSAccessKey: "AKIATEST", AWSSecretKey: "test-secret", GoogleRefreshToken: "refresh", AzureClientID: "client-1", AzureClientSecret: "secret"}}
+	emu, err := Start(context.Background(), c, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emu.Close()
+	c = emu.Config()
+	mysqlDriver.RegisterDialContext("iamproxy-integration", func(ctx context.Context, addr string) (net.Conn, error) {
+		return emu.DialContext(ctx, "tcp", addr)
+	})
+	if err = mysqlDriver.RegisterTLSConfig("iamproxy-integration", &tls.Config{RootCAs: emu.CertPool()}); err != nil {
+		t.Fatal(err)
+	}
+	clientHTTP := &http.Client{Timeout: time.Second}
+	issueGoogle := func() string {
+		req, _ := http.NewRequest("GET", c.PublicURL+"/computeMetadata/v1/instance/service-accounts/default/token?principal=alice", nil)
+		req.Header.Set("Metadata-Flavor", "Google")
+		r, e := clientHTTP.Do(req)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer r.Body.Close()
+		var v struct {
+			AccessToken string `json:"access_token"`
+		}
+		if e = json.NewDecoder(r.Body).Decode(&v); e != nil {
+			t.Fatal(e)
+		}
+		return v.AccessToken
+	}
+	issueAzure := func() string {
+		u := c.PublicURL + "/metadata/identity/oauth2/token?api-version=2018-02-01&resource=" + url.QueryEscape(azureAudience) + "&client_id=client-1"
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("Metadata", "true")
+		r, e := clientHTTP.Do(req)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer r.Body.Close()
+		var v struct {
+			AccessToken string `json:"access_token"`
+		}
+		if e = json.NewDecoder(r.Body).Decode(&v); e != nil {
+			t.Fatal(e)
+		}
+		return v.AccessToken
+	}
+	googleToken := issueGoogle()
+	azureToken := issueAzure()
+	for _, l := range c.Listeners {
+		for _, transport := range []string{"tcp", "memory"} {
+			t.Run(l.Name+"/"+transport, func(t *testing.T) {
+				username := "alice"
+				token := ""
+				switch l.Provider {
+				case "aws":
+					token = signIntegrationRDS(l, time.Now())
+				case "google":
+					token = googleToken
+					if l.Engine == "postgres" {
+						username = "alice@example.com"
+					}
+				case "azure":
+					token = azureToken
+					username = "alice@example.com"
+				}
+				_, port, _ := net.SplitHostPort(l.Listen)
+				// TCP reaches the bound loopback address; memory reaches the
+				// listener by its cloud hostname, which DNS cannot resolve.
+				host := "127.0.0.1"
+				if transport == "memory" {
+					host = l.Hostname
+				}
+				if l.Engine == "postgres" {
+					cfg, e := pgconn.ParseConfig("sslmode=verify-full host=" + host + " port=" + port)
+					if e != nil {
+						t.Fatal(e)
+					}
+					cfg.Database = "testdb"
+					cfg.User = username
+					cfg.Password = token
+					cfg.TLSConfig.RootCAs = emu.CertPool()
+					cfg.Fallbacks = nil
+					if transport == "memory" {
+						cfg.DialFunc = emu.DialContext
+						cfg.LookupFunc = func(_ context.Context, host string) ([]string, error) { return []string{host}, nil }
+					}
+					conn, e := pgconn.ConnectConfig(context.Background(), cfg)
+					if e != nil {
+						t.Fatal(e)
+					}
+					defer conn.Close(context.Background())
+					result := conn.ExecParams(context.Background(), "select current_user", nil, nil, nil, nil).Read()
+					if result.Err != nil || len(result.Rows) != 1 || string(result.Rows[0][0]) != "backend" {
+						t.Fatalf("current_user: %v %q", result.Err, result.Rows)
+					}
+					// pgx sends CancelRequest over TLS, like libpq 17+.
+					go func() {
+						time.Sleep(200 * time.Millisecond)
+						_ = conn.CancelRequest(context.Background())
+					}()
+					_, e = conn.Exec(context.Background(), "select pg_sleep(30)").ReadAll()
+					var pgErr *pgconn.PgError
+					if !errors.As(e, &pgErr) || pgErr.Code != "57014" {
+						t.Fatalf("cancelled query error = %v", e)
+					}
+				} else {
+					config := mysqlDriver.NewConfig()
+					config.User = username
+					config.Passwd = token
+					config.Net = "tcp"
+					if transport == "memory" {
+						config.Net = "iamproxy-integration"
+					}
+					config.Addr = net.JoinHostPort(host, port)
+					config.DBName = "testdb"
+					config.TLSConfig = "iamproxy-integration"
+					config.AllowCleartextPasswords = true
+					conn, e := sql.Open("mysql", config.FormatDSN())
+					if e != nil {
+						t.Fatal(e)
+					}
+					defer conn.Close()
+					var user string
+					if e = conn.QueryRow("select current_user()").Scan(&user); e != nil {
+						t.Fatal(e)
+					}
+					if !strings.HasPrefix(user, "backend@") {
+						t.Fatalf("current_user() = %q", user)
+					}
+				}
+			})
+		}
+	}
+	if err := emu.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func signIntegrationRDS(l Listener, now time.Time) string {
+	_, port, _ := net.SplitHostPort(l.Listen)
+	host := net.JoinHostPort(l.Hostname, port)
+	date := now.UTC().Format("20060102T150405Z")
+	cred := "AKIATEST/" + now.UTC().Format("20060102") + "/" + l.Region + "/rds-db/aws4_request"
+	v := url.Values{"Action": {"connect"}, "DBUser": {"alice"}, "X-Amz-Algorithm": {"AWS4-HMAC-SHA256"}, "X-Amz-Credential": {cred}, "X-Amz-Date": {date}, "X-Amz-Expires": {"900"}, "X-Amz-SignedHeaders": {"host"}}
+	canonical := "GET\n/\n" + awsQuery(v) + "\nhost:" + host + "\n\nhost\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	h := sha256.Sum256([]byte(canonical))
+	sts := "AWS4-HMAC-SHA256\n" + date + "\n" + strings.TrimPrefix(cred, "AKIATEST/") + "\n" + hex.EncodeToString(h[:])
+	k := awsHMAC([]byte("AWS4test-secret"), now.UTC().Format("20060102"))
+	k = awsHMAC(k, l.Region)
+	k = awsHMAC(k, "rds-db")
+	k = awsHMAC(k, "aws4_request")
+	v.Set("X-Amz-Signature", hex.EncodeToString(awsHMAC(k, sts)))
+	return host + "/?" + awsQuery(v)
+}

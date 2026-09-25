@@ -1,0 +1,21 @@
+# Engineering journal
+
+## 2026-09-25
+
+- Implemented six manual IAM database profiles behind TLS MySQL and PostgreSQL listeners, with fixture grants and configured backend accounts.
+- Added IMDSv2, Google metadata/OAuth, and Azure managed identity/OAuth mocks. The E2E harness drives AWS, Google Cloud, and Azure CLIs from a shared container image.
+- The shared image draws PostgreSQL 17, MySQL 8.4, and MariaDB 10.11 servers from official images. A Starlark scenario exercises MySQL protocol IAM logins against MariaDB.
+- Added ECS task credentials and task metadata v4 fixture paths. An AWS CLI E2E scenario selects the container credential provider, fetches mock credentials, signs an RDS token, and authenticates to both database engines.
+- Azure CLI uses a mock managed identity endpoint and local TLS resource manager endpoint. The CLI rejects bearer tokens over HTTP resource manager URLs.
+- Replaced the opaque E2E `issue_token()` builtin with `spawn(argv)` and per-scenario `set_env()`. Cloud environment builders are shared in `e2e/scenarios/common.star`; Starlark scenarios show every CLI invocation.
+- Added the sibling agentic memory workflow names as repository-local skills and validated their frontmatter with the system skill validator.
+- Licensed the project under Apache-2.0 (`LICENSE`, README section). All `go.mod` dependencies are MIT, BSD, Apache-2.0, or MPL-2.0 (go-sql-driver/mysql, unmodified), so they are compatible.
+- Configuration is YAML (`config.yaml` default, `config.example.yaml`), decoded with `github.com/goccy/go-yaml` using `DisallowUnknownField`; empty input and multiple documents are rejected. Config fields are `omitempty` so a marshalled config round-trips exactly (nil slices otherwise come back as `[]`). The E2E harness writes its generated config as YAML. JSON-shaped files still parse, since YAML is a JSON superset.
+- `go get <module>@none` downgrades modules that transitively require it; restore their versions explicitly.
+- Moved `internal/emulator` to the public `iamproxy` package. `Start(ctx, cfg, Options)` returns an `Emulator` with bound addresses (`:0` supported), a generated or supplied certificate, an optional `*slog.Logger`, an upstream dialer hook, and in-memory `DialContext`; `Options.InMemory` leaves database listeners unbound. The CLI wraps `Start` and still requires `tls_cert`/`tls_key`; `Validate` no longer requires them or derives `public_url` (`Start` derives it after binding).
+- The Starlark harness still runs the CLI binary, so YAML and `-validate` keep live coverage; the opt-in `IAM_PROXY_E2E` Go test covers embedding over TCP and in memory against real databases.
+- Fixed: pgx v5.11 and libpq 17+ send CancelRequest over TLS when the session used TLS; the proxy rejected it after TLS ("invalid startup after TLS"), so cancellation from modern clients silently did nothing. The live integration test now cancels `pg_sleep(30)` and fails without the fix.
+- The MySQL frontend negotiates capabilities before the upstream is known. An upstream lacking a flag the client negotiated (for example `DEPRECATE_EOF`, always requested by go-sql-driver) previously produced misframed relays; the proxy now refuses with error 1235. go-mysql's own server package lacks `DEPRECATE_EOF`, so `internal/fakedb` hand-writes the MySQL fake.
+- go-mysql's client cannot log in to the proxy: it does not implement `mysql_clear_password`. It also exposes negotiated capabilities only via `CapabilityString()`; `HasCapability` reports requested flags.
+- The in-memory `memConn` is a buffered pipe (1 MiB per direction) rather than `net.Pipe`, whose synchronous writes can stall TLS close_notify. `golang.org/x/net/nettest.TestConn` caught expired deadlines not failing buffered reads and writes. x/net is pinned at v0.52.0 because newer versions bump x/sys, x/text, and the go directive.
+- Renamed the project to `github.com/moriyoshi/db-iam-auth-emulator-proxy`: module path, `cmd/db-iam-auth-emulator-proxy{,-e2e}`, binaries, and the `db-iam-auth-emulator-proxy-e2e:local` image. Earlier entries use the old `iam-auth-emulation-proxies` name. The Go package stays `iamproxy`; E2E container prefix `iam-proxy-e2e-` is unchanged.

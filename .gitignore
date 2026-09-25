@@ -1,0 +1,6 @@
+.agents-workspace/tmp/
+.agents-workspace/worktrees/
+config.json
+server.crt
+server.key
+config.yaml
