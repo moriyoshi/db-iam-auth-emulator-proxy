@@ -46,6 +46,14 @@ SQL rewriting. Backend PID/secret pairs are exposed to the client only while
 that session remains active and are mapped to its configured upstream for
 cancellation.
 
+The backend startup carries only `database`, `application_name`, and
+`replication`. `replication` is normalized as PostgreSQL parses it
+(`database` for logical walsender mode, a boolean for physical mode) and
+invalid values are refused before authentication, so replication clients such
+as pglogrepl and `pg_recvlogical` can run `IDENTIFY_SYSTEM` and
+`START_REPLICATION` through the proxy. The backend account still needs the
+`REPLICATION` attribute.
+
 MySQL sends a TLS-capable handshake advertising `mysql_clear_password`, parses
 the TLS client response, validates the token, and logs into the upstream using
 `go-mysql`. The frontend handshake finishes before the upstream is known, so
@@ -60,12 +68,19 @@ file upload are not advertised.
 
 - AWS: SigV4 presigned `rds-db` URL, endpoint/port, DBUser, scope, timestamp,
   session token, and fixture grant. Signing uses the hash of the empty request
-  body, matching `aws rds generate-db-auth-token`. Fixture credentials are
+  body, matching `aws rds generate-db-auth-token`. An empty URL path, as
+  emitted by aws-sdk-go-v2 `rds/auth.BuildAuthToken`, is the SigV4 canonical
+  `/`; any other path is rejected. Fixture credentials are
   available from IMDSv2 and ECS container credential endpoints.
 - Google: opaque mock OAuth token registry, scope, expiry, fixture principal,
   grant, and Cloud SQL engine-specific username normalization.
 - Azure: RS256 JWT signature, mock issuer, tenant, database audience, validity
-  window, principal, group membership, and listener grant.
+  window, principal, group membership, and listener grant. The client
+  credentials endpoint accepts only `https://ossrdbms-aad.database.windows.net/.default`,
+  optionally with the `openid offline_access profile` scopes MSAL appends, and
+  always issues that audience. Over TLS, tenant discovery reports the request
+  origin as its issuer because MSAL requires it to match the https authority;
+  issued tokens keep the `public_url` issuer the validator checks.
 
 The mock endpoint surface is intentionally bounded. Cloud SQL connector
 transport, real cloud IAM policy APIs, database provisioning, and transparent

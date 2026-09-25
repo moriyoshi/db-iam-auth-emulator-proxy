@@ -354,7 +354,7 @@ func (h *mockHTTP) azureOAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant := parts[0]
-	if r.Form.Get("grant_type") != "client_credentials" || r.Form.Get("scope") != azureAudience+"/.default" {
+	if r.Form.Get("grant_type") != "client_credentials" || !azureClientCredentialScope(r.Form.Get("scope")) {
 		http.Error(w, "unsupported grant or scope", 400)
 		return
 	}
@@ -378,6 +378,23 @@ func (h *mockHTTP) azureOAuth(w http.ResponseWriter, r *http.Request) {
 	jsonReply(w, 200, map[string]any{"access_token": token, "expires_in": 3600, "ext_expires_in": 3600, "token_type": "Bearer"})
 }
 
+// azureClientCredentialScope accepts the OSS RDBMS ".default" scope, alone or
+// with the OIDC scopes MSAL appends to every token request. Tokens are only
+// ever issued for azureAudience.
+func azureClientCredentialScope(scope string) bool {
+	resource := 0
+	for _, s := range strings.Fields(scope) {
+		switch s {
+		case azureAudience + "/.default":
+			resource++
+		case "openid", "offline_access", "profile":
+		default:
+			return false
+		}
+	}
+	return resource == 1
+}
+
 func (h *mockHTTP) azureDiscovery(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 3 {
@@ -385,6 +402,22 @@ func (h *mockHTTP) azureDiscovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant := parts[0]
-	base := strings.TrimRight(h.s.Config.PublicURL, "/") + "/" + tenant
-	jsonReply(w, 200, map[string]any{"issuer": base + "/v2.0", "token_endpoint": base + "/oauth2/v2.0/token", "jwks_uri": base + "/discovery/v2.0/keys", "response_types_supported": []string{"token"}, "id_token_signing_alg_values_supported": []string{"RS256"}})
+	// MSAL requires the issuer to share the authority's scheme and host, and
+	// only accepts an https authority, so answer TLS requests with the origin
+	// the client used.
+	origin := strings.TrimRight(h.s.Config.PublicURL, "/")
+	if r.TLS != nil {
+		origin = "https://" + r.Host
+	}
+	base := origin + "/" + tenant
+	jsonReply(w, 200, map[string]any{
+		"issuer":                                base + "/v2.0",
+		"authorization_endpoint":                base + "/oauth2/v2.0/authorize",
+		"token_endpoint":                        base + "/oauth2/v2.0/token",
+		"jwks_uri":                              base + "/discovery/v2.0/keys",
+		"response_types_supported":              []string{"token"},
+		"scopes_supported":                      []string{"openid", "profile", "offline_access"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_post"},
+		"id_token_signing_alg_values_supported": []string{"RS256"},
+	})
 }

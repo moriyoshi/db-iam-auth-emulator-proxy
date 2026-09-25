@@ -1,12 +1,16 @@
 package iamproxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	rdsauth "github.com/aws/aws-sdk-go-v2/feature/rds/auth"
 )
 
 func fixtureService(t *testing.T) (*service, []Listener) {
@@ -55,6 +59,45 @@ func TestRDSValidation(t *testing.T) {
 	s.Now = func() time.Time { return time.Date(2026, 9, 25, 0, 16, 0, 0, time.UTC) }
 	if _, err := s.Validate(l[0], "alice", token); err == nil {
 		t.Fatal("expired token accepted")
+	}
+}
+
+func TestRDSValidationAWSSDK(t *testing.T) {
+	s, l := fixtureService(t)
+	s.Now = time.Now
+	build := func(region, secret string) string {
+		t.Helper()
+		creds := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "AKIATEST", SecretAccessKey: secret}, nil
+		})
+		token, err := rdsauth.BuildAuthToken(context.Background(), "db.test:15432", region, "alice", creds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token
+	}
+	token := build("us-east-1", "test-secret")
+	if !strings.HasPrefix(token, "db.test:15432?") {
+		t.Fatalf("SDK token shape changed: %q", token)
+	}
+	if _, err := s.Validate(l[0], "alice", token); err != nil {
+		t.Fatalf("SDK token: %v", err)
+	}
+	// An explicit "/" path signs identically.
+	if _, err := s.Validate(l[0], "alice", strings.Replace(token, "?", "/?", 1)); err != nil {
+		t.Fatalf("SDK token with slash path: %v", err)
+	}
+	for name, bad := range map[string]string{
+		"wrong secret":   build("us-east-1", "other-secret"),
+		"wrong region":   build("us-west-2", "test-secret"),
+		"wrong user":     strings.Replace(token, "DBUser=alice", "DBUser=bob", 1),
+		"other path":     strings.Replace(token, "?", "/x?", 1),
+		"encoded path":   strings.Replace(token, "?", "/%2F?", 1),
+		"tampered query": strings.Replace(token, "X-Amz-Expires=900", "X-Amz-Expires=899", 1),
+	} {
+		if _, err := s.Validate(l[0], "alice", bad); err == nil {
+			t.Errorf("%s accepted", name)
+		}
 	}
 }
 

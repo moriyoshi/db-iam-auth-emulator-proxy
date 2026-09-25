@@ -8,7 +8,8 @@ fi
 engine="${2:-}"
 case "$engine" in
     postgres)
-        exec /usr/local/bin/docker-entrypoint.sh postgres
+        # wal_level=logical lets scenarios exercise logical replication through the proxy.
+        exec /usr/local/bin/docker-entrypoint.sh postgres -c wal_level=logical
         ;;
     mysql)
         mv /etc/mysql /etc/mysql-disabled

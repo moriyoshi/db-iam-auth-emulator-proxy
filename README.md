@@ -55,6 +55,23 @@ and `/<tenant>/discovery/v2.0/keys`. Point SDK credential source URLs to the
 mock base URL explicitly; SDK support for endpoint overrides varies. The mock
 does not intercept cloud hostnames or support all SDK credential chains.
 
+`DefaultAzureCredential` and other MSAL-based client secret credentials work
+offline against the TLS routes: set `AZURE_AUTHORITY_HOST` to the
+`https_listen` base URL with a trailing slash, `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`, trust the proxy certificate in
+the credential's HTTP transport, and set `DisableInstanceDiscovery` (MSAL
+otherwise asks `login.microsoftonline.com` to validate the authority). Request
+the `https://ossrdbms-aad.database.windows.net/.default` scope; other
+audiences are refused.
+
+AWS SDK for Go v2 `rds/auth.BuildAuthToken` tokens (`host:port?...`, without a
+`/` path) are accepted like AWS CLI tokens.
+
+PostgreSQL listeners forward the `replication` startup parameter, so logical
+replication clients (`replication=database`) and physical ones
+(`replication=true`) work when the backend account has `REPLICATION` and the
+upstream allows it (for logical decoding, `wal_level=logical`).
+
 Set `https_listen` to expose the same credential routes over TLS with
 `tls_cert` and `tls_key`. The E2E Azure CLI scenario uses this for a local
 mock resource manager and trusts the fixture certificate.

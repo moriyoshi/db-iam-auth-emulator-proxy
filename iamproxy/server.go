@@ -165,8 +165,9 @@ func (e *Emulator) serve(ctx context.Context, tcp []net.Listener, httpLn, httpsL
 		wg.Go(func() { e.accept(ctx, ln, l) })
 	}
 	handler := e.svc.HTTPHandler()
-	servers := []*http.Server{{Handler: handler, ReadHeaderTimeout: 5 * time.Second}}
-	wg.Go(func() { e.serveHTTP(servers[0], httpLn) })
+	plain := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	servers := []*http.Server{plain}
+	wg.Go(func() { e.serveHTTP(plain, httpLn) })
 	e.log.Info("credential endpoints", "addr", c.HTTPListen)
 	if httpsLn != nil {
 		srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}

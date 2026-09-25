@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,7 +18,9 @@ import (
 	"time"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func TestIntegrationSixProfiles(t *testing.T) {
@@ -181,6 +184,110 @@ func TestIntegrationSixProfiles(t *testing.T) {
 	}
 	if err := emu.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestIntegrationPostgresLogicalReplication streams logical decoding through
+// the proxy with pglogrepl. The upstream needs wal_level=logical and a backend
+// user with REPLICATION.
+func TestIntegrationPostgresLogicalReplication(t *testing.T) {
+	if os.Getenv("IAM_PROXY_E2E") != "1" {
+		t.Skip("set IAM_PROXY_E2E=1 and provide a local PostgreSQL with wal_level=logical")
+	}
+	pgAddr := os.Getenv("IAM_PROXY_PG_ADDR")
+	if pgAddr == "" {
+		pgAddr = "127.0.0.1:25432"
+	}
+	c := &Config{
+		Listeners:  []Listener{{Name: "aws-postgres", Listen: "127.0.0.1:0", Provider: "aws", Engine: "postgres", Instance: "testdb", Hostname: "aws-postgres.db.test", Region: "us-east-1", ResourceID: "db-test", Upstream: pgAddr, UpstreamTLS: "disable"}},
+		Principals: []Principal{{ID: "alice", Grants: []string{"aws-postgres"}, BackendUser: "backend", BackendPassword: "backpass", AWSAccessKey: "AKIATEST", AWSSecretKey: "test-secret"}},
+	}
+	emu, err := Start(context.Background(), c, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emu.Close()
+	l := emu.Config().Listeners[0]
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	connect := func(params map[string]string) *pgconn.PgConn {
+		t.Helper()
+		_, port, _ := net.SplitHostPort(l.Listen)
+		cfg, e := pgconn.ParseConfig("sslmode=verify-full dbname=testdb host=" + l.Hostname + " port=" + port)
+		if e != nil {
+			t.Fatal(e)
+		}
+		cfg.User = "alice"
+		cfg.Password = signIntegrationRDS(l, time.Now())
+		cfg.TLSConfig.RootCAs = emu.CertPool()
+		cfg.Fallbacks = nil
+		cfg.DialFunc = emu.DialContext
+		cfg.LookupFunc = func(_ context.Context, host string) ([]string, error) { return []string{host}, nil }
+		for k, v := range params {
+			cfg.RuntimeParams[k] = v
+		}
+		conn, e := pgconn.ConnectConfig(ctx, cfg)
+		if e != nil {
+			t.Fatal(e)
+		}
+		t.Cleanup(func() { _ = conn.Close(context.Background()) })
+		return conn
+	}
+	normal := connect(nil)
+	if _, err = normal.Exec(ctx, "create table if not exists iamproxy_repl_probe (id serial primary key, marker text not null)").ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	repl := connect(map[string]string{"replication": "database"})
+	sys, err := pglogrepl.IdentifySystem(ctx, repl)
+	if err != nil {
+		t.Fatalf("IDENTIFY_SYSTEM through proxy: %v", err)
+	}
+	if sys.DBName != "testdb" {
+		t.Fatalf("IDENTIFY_SYSTEM dbname = %q", sys.DBName)
+	}
+	slot := fmt.Sprintf("iamproxy_probe_%d", time.Now().UnixNano())
+	created, err := pglogrepl.CreateReplicationSlot(ctx, repl, slot, "test_decoding", pglogrepl.CreateReplicationSlotOptions{Temporary: true, Mode: pglogrepl.LogicalReplication})
+	if err != nil {
+		t.Fatalf("CREATE_REPLICATION_SLOT through proxy: %v", err)
+	}
+	start, err := pglogrepl.ParseLSN(created.ConsistentPoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = pglogrepl.StartReplication(ctx, repl, slot, start, pglogrepl.StartReplicationOptions{Mode: pglogrepl.LogicalReplication}); err != nil {
+		t.Fatalf("START_REPLICATION through proxy: %v", err)
+	}
+	marker := "marker-" + slot
+	if _, err = normal.Exec(ctx, "insert into iamproxy_repl_probe (marker) values ('"+marker+"')").ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		msg, e := repl.ReceiveMessage(ctx)
+		if e != nil {
+			t.Fatalf("replication stream: %v", e)
+		}
+		cd, ok := msg.(*pgproto3.CopyData)
+		if !ok {
+			t.Fatalf("unexpected replication message %T", msg)
+		}
+		if len(cd.Data) == 0 || cd.Data[0] != pglogrepl.XLogDataByteID {
+			continue
+		}
+		x, e := pglogrepl.ParseXLogData(cd.Data[1:])
+		if e != nil {
+			t.Fatal(e)
+		}
+		if strings.Contains(string(x.WALData), "INSERT") && strings.Contains(string(x.WALData), marker) {
+			end := x.WALStart + pglogrepl.LSN(len(x.WALData))
+			if e = pglogrepl.SendStandbyStatusUpdate(ctx, repl, pglogrepl.StandbyStatusUpdate{WALWritePosition: end}); e != nil {
+				t.Fatal(e)
+			}
+			break
+		}
+	}
+	result := normal.ExecParams(ctx, "select count(*) from iamproxy_repl_probe where marker = $1", [][]byte{[]byte(marker)}, nil, nil, nil).Read()
+	if result.Err != nil || len(result.Rows) != 1 || string(result.Rows[0][0]) != "1" {
+		t.Fatalf("normal query alongside replication: %v %q", result.Err, result.Rows)
 	}
 }
 

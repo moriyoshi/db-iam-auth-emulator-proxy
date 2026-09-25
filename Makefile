@@ -7,7 +7,8 @@ E2E_SCENARIOS := \
 	e2e/scenarios/six-profiles.star \
 	e2e/scenarios/aws-imdsv2-cli.star \
 	e2e/scenarios/aws-ecs-cli.star \
-	e2e/scenarios/mariadb-fixture.star
+	e2e/scenarios/mariadb-fixture.star \
+	e2e/scenarios/postgres-logical-replication.star
 E2E_FLAGS ?=
 
 .PHONY: build test e2e-check e2e-image e2e e2e-one

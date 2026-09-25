@@ -52,7 +52,9 @@ func (s *service) validateAWS(l Listener, username, token string) (*Principal, e
 		return nil, errors.New("scheme not allowed")
 	}
 	u, err := url.Parse("https://" + token)
-	if err != nil || u.User != nil || u.Fragment != "" || u.Path != "/" {
+	// aws-sdk-go-v2 rds/auth.BuildAuthToken signs "host:port?query" with an
+	// empty path; SigV4 canonicalizes that to "/", as used below.
+	if err != nil || u.User != nil || u.Fragment != "" || u.RawPath != "" || u.Path != "/" && u.Path != "" {
 		return nil, errors.New("invalid token URL")
 	}
 	_, port, err := net.SplitHostPort(l.Listen)

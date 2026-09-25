@@ -114,6 +114,21 @@ func pgPassword(c net.Conn) (string, error) {
 	return string(b[:len(b)-1]), nil
 }
 
+// pgReplicationMode normalizes the startup "replication" parameter the way
+// PostgreSQL parses it: "database" selects logical walsender mode, and a
+// boolean selects physical walsender mode or a normal session.
+func pgReplicationMode(v string) (string, error) {
+	switch strings.ToLower(v) {
+	case "", "false", "off", "no", "0":
+		return "", nil
+	case "true", "on", "yes", "1":
+		return "true", nil
+	case "database":
+		return "database", nil
+	}
+	return "", errors.New("invalid replication parameter")
+}
+
 type pgCancelTarget struct{ upstream string }
 
 func (e *Emulator) servePostgres(ctx context.Context, conn net.Conn, l Listener) error {
@@ -152,6 +167,11 @@ func (e *Emulator) servePostgres(ctx context.Context, conn net.Conn, l Listener)
 	if username == "" {
 		pgFatal(conn, "28000", "user required")
 		return errors.New("user required")
+	}
+	replication, err := pgReplicationMode(params["replication"])
+	if err != nil {
+		pgFatal(conn, "22023", "invalid value for parameter \"replication\"")
+		return err
 	}
 	var request [4]byte
 	binary.BigEndian.PutUint32(request[:], 3)
@@ -198,6 +218,12 @@ func (e *Emulator) servePostgres(ctx context.Context, conn net.Conn, l Listener)
 	}
 	if v := params["application_name"]; v != "" {
 		pcfg.RuntimeParams["application_name"] = v
+	}
+	// Replication clients select walsender mode at startup; the backend
+	// session must be opened in the same mode for IDENTIFY_SYSTEM and
+	// START_REPLICATION to work after handoff.
+	if replication != "" {
+		pcfg.RuntimeParams["replication"] = replication
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

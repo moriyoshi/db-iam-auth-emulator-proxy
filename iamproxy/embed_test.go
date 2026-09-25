@@ -36,6 +36,11 @@ func startEmbedded(t *testing.T, c *Config, o Options) *Emulator {
 // resolve, and verifies the emulator's certificate for that name.
 func memoryPostgres(t *testing.T, e *Emulator, password string) (*pgconn.PgConn, error) {
 	t.Helper()
+	return memoryPostgresParams(t, e, password, nil)
+}
+
+func memoryPostgresParams(t *testing.T, e *Emulator, password string, params map[string]string) (*pgconn.PgConn, error) {
+	t.Helper()
 	l := e.Config().Listeners[0]
 	_, port, _ := net.SplitHostPort(l.Listen)
 	cfg, err := pgconn.ParseConfig("sslmode=verify-full dbname=appdb host=" + l.Hostname + " port=" + port)
@@ -47,6 +52,9 @@ func memoryPostgres(t *testing.T, e *Emulator, password string) (*pgconn.PgConn,
 	cfg.TLSConfig.RootCAs = e.CertPool()
 	cfg.DialFunc = e.DialContext
 	cfg.LookupFunc = func(_ context.Context, host string) ([]string, error) { return []string{host}, nil }
+	for k, v := range params {
+		cfg.RuntimeParams[k] = v
+	}
 	return pgconn.ConnectConfig(context.Background(), cfg)
 }
 
@@ -81,6 +89,37 @@ func TestEmbeddedPostgresInMemory(t *testing.T) {
 	}
 	if dials := upstream.Dials(); len(dials) != 2 || dials[1] != "upstream.internal:5432" {
 		t.Fatalf("cancel dialed %q", dials)
+	}
+}
+
+func TestEmbeddedPostgresReplicationStartup(t *testing.T) {
+	upstream := &fakedb.Server{User: "backend", Password: "backpass"}
+	e := startEmbedded(t, embeddedConfig("postgres", "127.0.0.1:15432"), Options{InMemory: true, UpstreamDialer: upstream.PostgresDialer})
+	l := e.Config().Listeners[0]
+	for _, tc := range []struct{ client, upstream string }{{"database", "database"}, {"true", "true"}, {"on", "true"}, {"off", ""}, {"", ""}} {
+		var params map[string]string
+		if tc.client != "" {
+			params = map[string]string{"replication": tc.client}
+		}
+		conn, err := memoryPostgresParams(t, e, signIntegrationRDS(l, time.Now()), params)
+		if err != nil {
+			t.Fatalf("replication=%q: %v", tc.client, err)
+		}
+		conn.Close(context.Background())
+		s := upstream.Startups()
+		got, ok := s[len(s)-1]["replication"]
+		if tc.upstream == "" && ok || tc.upstream != "" && got != tc.upstream {
+			t.Errorf("replication=%q reached upstream as %q (present %v), want %q", tc.client, got, ok, tc.upstream)
+		}
+	}
+	dials := len(upstream.Dials())
+	_, err := memoryPostgresParams(t, e, signIntegrationRDS(l, time.Now()), map[string]string{"replication": "bogus"})
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
+		t.Fatalf("invalid replication error = %v", err)
+	}
+	if len(upstream.Dials()) != dials {
+		t.Fatal("invalid replication parameter dialed upstream")
 	}
 }
 
